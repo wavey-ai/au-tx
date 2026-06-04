@@ -1,16 +1,106 @@
 use frame_header::{EncodingFlag, Endianness, FrameHeader};
 use rtrb::{Consumer, Producer, RingBuffer};
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void, CStr};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BITS_PER_SAMPLE: u8 = 24;
 const RECONNECT_INTERVAL: Duration = Duration::from_millis(50);
+const METADATA_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const RING_SIZE: usize = 256;
+const MAX_METADATA_FIELD_BYTES: usize = 512;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TrackMetadata {
+    instance_id: Option<String>,
+    label: Option<String>,
+}
+
+impl TrackMetadata {
+    fn is_empty(&self) -> bool {
+        self.instance_id.is_none() && self.label.is_none()
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AudioProcessorStatus {
+    pub started: bool,
+    pub connected: bool,
+    pub frames_queued: u64,
+    pub frames_sent: u64,
+    pub frames_dropped: u64,
+    pub connection_attempts: u64,
+    pub connection_failures: u64,
+    pub last_connected_unix_ms: u64,
+    pub last_send_unix_ms: u64,
+}
+
+#[derive(Debug, Default)]
+struct AudioProcessorStatusCounters {
+    started: AtomicBool,
+    connected: AtomicBool,
+    frames_queued: AtomicU64,
+    frames_sent: AtomicU64,
+    frames_dropped: AtomicU64,
+    connection_attempts: AtomicU64,
+    connection_failures: AtomicU64,
+    last_connected_unix_ms: AtomicU64,
+    last_send_unix_ms: AtomicU64,
+}
+
+impl AudioProcessorStatusCounters {
+    fn snapshot(&self) -> AudioProcessorStatus {
+        AudioProcessorStatus {
+            started: self.started.load(Ordering::Acquire),
+            connected: self.connected.load(Ordering::Acquire),
+            frames_queued: self.frames_queued.load(Ordering::Acquire),
+            frames_sent: self.frames_sent.load(Ordering::Acquire),
+            frames_dropped: self.frames_dropped.load(Ordering::Acquire),
+            connection_attempts: self.connection_attempts.load(Ordering::Acquire),
+            connection_failures: self.connection_failures.load(Ordering::Acquire),
+            last_connected_unix_ms: self.last_connected_unix_ms.load(Ordering::Acquire),
+            last_send_unix_ms: self.last_send_unix_ms.load(Ordering::Acquire),
+        }
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn metadata_field_from_c(value: *const c_char) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+
+    let value = unsafe { CStr::from_ptr(value) }.to_string_lossy();
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Some(truncate_utf8(trimmed, MAX_METADATA_FIELD_BYTES).to_owned())
+}
 
 pub struct AudioProcessor {
     socket_path: String,
@@ -21,7 +111,10 @@ pub struct AudioProcessor {
     samples_per_channel: Option<usize>,
     shutdown: Arc<AtomicBool>,
     started: Arc<AtomicBool>,
+    status: Arc<AudioProcessorStatusCounters>,
     data_ready: Arc<(Mutex<bool>, Condvar)>,
+    metadata: Arc<RwLock<TrackMetadata>>,
+    metadata_version: Arc<AtomicU64>,
     tx_thread: Option<JoinHandle<()>>,
     num_channels: u8,
     sample_rate: u32,
@@ -42,7 +135,10 @@ impl AudioProcessor {
             num_channels,
             shutdown: Arc::new(AtomicBool::new(false)),
             started: Arc::new(AtomicBool::new(false)),
+            status: Arc::new(AudioProcessorStatusCounters::default()),
             data_ready: Arc::new((Mutex::new(false), Condvar::new())),
+            metadata: Arc::new(RwLock::new(TrackMetadata::default())),
+            metadata_version: Arc::new(AtomicU64::new(0)),
             tx_thread: None,
             sample_rate,
             frame_id: None,
@@ -56,6 +152,7 @@ impl AudioProcessor {
 
     fn handle_connection(
         mut stream: UnixStream,
+        socket_path: &str,
         samples_per_channel: usize,
         num_channels: u8,
         sample_rate: u32,
@@ -64,6 +161,9 @@ impl AudioProcessor {
         free_producer: &mut Producer<Vec<u8>>,
         data_ready: Arc<(Mutex<bool>, Condvar)>,
         frame_id: Option<u16>,
+        status: Arc<AudioProcessorStatusCounters>,
+        metadata: Arc<RwLock<TrackMetadata>>,
+        metadata_version: Arc<AtomicU64>,
     ) -> Result<(), std::io::Error> {
         stream.write_all(b"HELO")?;
 
@@ -75,6 +175,18 @@ impl AudioProcessor {
         } else {
             u16::from_le_bytes(id_buf)
         } as u64;
+
+        let stream_id = id as u16;
+        let mut sent_metadata_version = metadata_version.load(Ordering::Acquire);
+        let mut last_metadata_attempt = Instant::now();
+        if let Ok(snapshot) = metadata.read().map(|metadata| metadata.clone()) {
+            Self::send_metadata_control(socket_path, stream_id, &snapshot).ok();
+        }
+
+        status.connected.store(true, Ordering::Release);
+        status
+            .last_connected_unix_ms
+            .store(now_unix_ms(), Ordering::Release);
 
         let header = FrameHeader::new(
             EncodingFlag::PCMSigned,
@@ -115,6 +227,20 @@ impl AudioProcessor {
                 return Ok(());
             }
 
+            let current_metadata_version = metadata_version.load(Ordering::Acquire);
+            if current_metadata_version != sent_metadata_version
+                || last_metadata_attempt.elapsed() >= METADATA_HEARTBEAT_INTERVAL
+            {
+                last_metadata_attempt = Instant::now();
+                if let Ok(snapshot) = metadata.read().map(|metadata| metadata.clone()) {
+                    if Self::send_metadata_control(socket_path, stream_id, &snapshot).is_ok() {
+                        sent_metadata_version = current_metadata_version;
+                    }
+                } else {
+                    sent_metadata_version = current_metadata_version;
+                }
+            }
+
             'inner: for _ in 0..consumer.slots() {
                 match consumer.pop() {
                     Ok((ts, buf)) => {
@@ -127,6 +253,10 @@ impl AudioProcessor {
                         // Return buffer to free pool before propagating any error
                         free_producer.push(buf).ok();
                         result?;
+                        status.frames_sent.fetch_add(1, Ordering::Relaxed);
+                        status
+                            .last_send_unix_ms
+                            .store(now_unix_ms(), Ordering::Release);
                     }
                     Err(_) => {
                         break 'inner;
@@ -138,6 +268,41 @@ impl AudioProcessor {
                 return Ok(());
             }
         }
+    }
+
+    fn send_metadata_control(
+        socket_path: &str,
+        stream_id: u16,
+        metadata: &TrackMetadata,
+    ) -> Result<(), std::io::Error> {
+        if metadata.is_empty() {
+            return Ok(());
+        }
+
+        let instance_id = metadata.instance_id.as_deref().unwrap_or("");
+        let label = metadata.label.as_deref().unwrap_or("");
+        let mut stream = UnixStream::connect(socket_path)?;
+        stream.write_all(b"META")?;
+        stream.write_all(&stream_id.to_le_bytes())?;
+        stream.write_all(&(instance_id.len() as u16).to_le_bytes())?;
+        stream.write_all(&(label.len() as u16).to_le_bytes())?;
+        stream.write_all(instance_id.as_bytes())?;
+        stream.write_all(label.as_bytes())?;
+        Ok(())
+    }
+
+    pub fn set_track_metadata(&self, instance_id: Option<String>, label: Option<String>) {
+        let next = TrackMetadata { instance_id, label };
+        let Ok(mut metadata) = self.metadata.write() else {
+            return;
+        };
+
+        if *metadata == next {
+            return;
+        }
+
+        *metadata = next;
+        self.metadata_version.fetch_add(1, Ordering::Release);
     }
 
     pub fn add(&mut self, data: &[u8], ts: u64) {
@@ -160,8 +325,10 @@ impl AudioProcessor {
         buf.extend_from_slice(data);
 
         if self.data_producer.push((ts, buf)).is_err() {
+            self.status.frames_dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        self.status.frames_queued.fetch_add(1, Ordering::Relaxed);
 
         // Notify tx thread (skip syscall if already signaled)
         let (lock, cvar) = &*self.data_ready;
@@ -182,6 +349,9 @@ impl AudioProcessor {
     fn start_tx(&mut self, frame_size: usize) {
         let shutdown_flag = Arc::clone(&self.shutdown);
         let data_ready = Arc::clone(&self.data_ready);
+        let status = Arc::clone(&self.status);
+        let metadata = Arc::clone(&self.metadata);
+        let metadata_version = Arc::clone(&self.metadata_version);
         let socket_path = self.socket_path.clone();
 
         let mut data_consumer = self
@@ -206,10 +376,12 @@ impl AudioProcessor {
 
         let handle = thread::spawn(move || {
             while !shutdown_flag.load(Ordering::Acquire) {
+                status.connection_attempts.fetch_add(1, Ordering::Relaxed);
                 match Self::establish_connection(&socket_path) {
                     Some(stream) => {
-                        if let Err(_) = Self::handle_connection(
+                        if Self::handle_connection(
                             stream,
+                            &socket_path,
                             samples_per_channel,
                             num_channels,
                             sample_rate,
@@ -218,23 +390,37 @@ impl AudioProcessor {
                             &mut free_producer,
                             Arc::clone(&data_ready),
                             frame_id,
-                        ) {
+                            Arc::clone(&status),
+                            Arc::clone(&metadata),
+                            Arc::clone(&metadata_version),
+                        )
+                        .is_err()
+                        {
+                            status.connected.store(false, Ordering::Release);
+                            status.connection_failures.fetch_add(1, Ordering::Relaxed);
                             thread::sleep(RECONNECT_INTERVAL);
+                        } else {
+                            status.connected.store(false, Ordering::Release);
                         }
                     }
                     None => {
+                        status.connected.store(false, Ordering::Release);
+                        status.connection_failures.fetch_add(1, Ordering::Relaxed);
                         thread::sleep(RECONNECT_INTERVAL);
                     }
                 }
             }
+            status.connected.store(false, Ordering::Release);
         });
 
         self.tx_thread = Some(handle);
         self.started.store(true, Ordering::Release);
+        self.status.started.store(true, Ordering::Release);
     }
 
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        self.status.connected.store(false, Ordering::Release);
         // Notify in case Tx thread is waiting
         let (_, cvar) = &*self.data_ready;
         cvar.notify_all();
@@ -290,6 +476,37 @@ pub extern "C" fn audio_processor_add(
         let processor = &mut *(instance as *mut AudioProcessor);
         let data = std::slice::from_raw_parts(data_ptr, length);
         processor.add(data, ts);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn audio_processor_status(instance: *mut c_void) -> AudioProcessorStatus {
+    if instance.is_null() {
+        return AudioProcessorStatus::default();
+    }
+
+    unsafe {
+        let processor = &*(instance as *mut AudioProcessor);
+        processor.status.snapshot()
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn audio_processor_set_track_metadata(
+    instance: *mut c_void,
+    instance_id: *const c_char,
+    label: *const c_char,
+) {
+    if instance.is_null() {
+        return;
+    }
+
+    unsafe {
+        let processor = &*(instance as *mut AudioProcessor);
+        processor.set_track_metadata(
+            metadata_field_from_c(instance_id),
+            metadata_field_from_c(label),
+        );
     }
 }
 
@@ -395,7 +612,7 @@ mod tests {
 
     #[test]
     fn test_audio_processor_lifecycle() {
-        const SOCKET_PATH: &str = "/tmp/au-trx-test.sock";
+        const SOCKET_PATH: &str = "/tmp/au-tx-test.sock";
 
         let server = MockAudioServer::new(SOCKET_PATH);
         let received_frames = server.start();
@@ -434,8 +651,16 @@ mod tests {
 
         let first_frame = &frames[0];
         assert_eq!(first_frame.header.channels(), 2, "Expected stereo");
-        assert_eq!(first_frame.header.bits_per_sample(), 24, "Expected 24-bit audio");
-        assert_eq!(first_frame.header.sample_rate(), 48_000, "Expected 48kHz sample rate");
+        assert_eq!(
+            first_frame.header.bits_per_sample(),
+            24,
+            "Expected 24-bit audio"
+        );
+        assert_eq!(
+            first_frame.header.sample_rate(),
+            48_000,
+            "Expected 48kHz sample rate"
+        );
         assert_eq!(
             first_frame.audio_data.len(),
             3 * 2 * num_samples,

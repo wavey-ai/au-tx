@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "au-trx"
+name = "au-tx"
 version = "0.2.0"
 dependencies = [
  "ctrlc",
@@ -49,8 +49,7 @@ dependencies = [
 
 [[package]]
 name = "frame-header"
-version = "0.1.0"
-source = "git+ssh://git@github.com/wavey-ai/frame-header.git#a8c1726a4afd0a8f447bf5ccce5cbeccaec94975"
+version = "0.2.0"
 dependencies = [
  "serde",
 ]
