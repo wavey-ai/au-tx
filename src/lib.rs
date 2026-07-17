@@ -1869,10 +1869,18 @@ mod tests {
 
     #[test]
     fn constructor_prewarms_and_pool_pressure_drops_without_growing_backlog() {
-        const SOCKET_PATH: &str = "/tmp/au-tx-no-server-test.sock";
-        let _ = std::fs::remove_file(SOCKET_PATH);
-        let mut processor = AudioProcessor::new_preallocated(SOCKET_PATH.to_owned(), 2, 48_000, 64);
+        let socket_path = unique_socket_path();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let accepted = Arc::new(Barrier::new(2));
+        let server_accepted = Arc::clone(&accepted);
+        let server = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            server_accepted.wait();
+            thread::sleep(Duration::from_millis(100));
+        });
+        let mut processor = AudioProcessor::new_preallocated(socket_path.clone(), 2, 48_000, 64);
         assert!(processor.status().started);
+        accepted.wait();
 
         let data = vec![0x7f; 64 * 2 * 3];
         for sample_position in 0..(RING_SIZE as i64 + 5) {
@@ -1884,6 +1892,8 @@ mod tests {
         assert_eq!(status.frames_dropped, 5);
         processor.shutdown();
         assert!(!processor.status().started);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(socket_path);
     }
 
     #[test]
@@ -2028,12 +2038,12 @@ mod tests {
             enabled: false,
         });
 
-        processor.add(&vec![0x10; 2 * 3], -2, 1);
+        processor.add(&[0x10; 2 * 3], -2, 1);
         processor.set_archive_enabled(true);
         let captured = vec![0x20; 4 * 3];
         processor.add(&captured, 0, 1);
         processor.set_archive_enabled(false);
-        processor.add(&vec![0x30; 2 * 3], 4, 1);
+        processor.add(&[0x30; 2 * 3], 4, 1);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while !processor.archive_status().flush_complete && std::time::Instant::now() < deadline {
