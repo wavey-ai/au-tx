@@ -20,11 +20,13 @@ const METADATA_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const RING_SIZE: usize = 16;
 const DEFAULT_MAX_FRAMES: usize = 4095;
 const MAX_HEADER_BYTES: usize = 20;
+const SAMPLE_CLOCK_BYTES: usize = 12;
 const MAX_METADATA_FIELD_BYTES: usize = 512;
 
 #[derive(Debug)]
 struct QueuedFrame {
-    pts_us: u64,
+    sample_position: i64,
+    transport_generation: u32,
     data: Vec<u8>,
 }
 
@@ -274,7 +276,7 @@ impl AudioProcessor {
         metadata: Arc<RwLock<TrackMetadata>>,
         metadata_version: Arc<AtomicU64>,
     ) -> Result<(), std::io::Error> {
-        stream.write_all(b"HELO")?;
+        stream.write_all(b"AUD2")?;
 
         let mut id_buf = [0u8; 2];
         stream.read_exact(&mut id_buf)?;
@@ -298,7 +300,8 @@ impl AudioProcessor {
             .store(now_unix_ms(), Ordering::Release);
 
         let mut header_data = Vec::with_capacity(MAX_HEADER_BYTES);
-        let mut send_buffer = Vec::with_capacity(max_frame_bytes + MAX_HEADER_BYTES + 4);
+        let mut send_buffer =
+            Vec::with_capacity(max_frame_bytes + MAX_HEADER_BYTES + SAMPLE_CLOCK_BYTES + 4);
 
         // Reconnection is a live-edge operation. Never replay the AU backlog
         // accumulated while Nexus was unavailable; retain only the newest frame.
@@ -418,7 +421,7 @@ impl AudioProcessor {
             BITS_PER_SAMPLE,
             Endianness::LittleEndian,
             Some(id),
-            Some(frame.pts_us),
+            None,
         )
         .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidData, message))?;
 
@@ -426,7 +429,10 @@ impl AudioProcessor {
         header.encode(&mut *header_data)?;
         let total_size = 4 + header_data.len() + frame.data.len();
         send_buffer.clear();
+        let total_size = total_size + SAMPLE_CLOCK_BYTES;
         send_buffer.extend_from_slice(&(total_size as u32).to_le_bytes());
+        send_buffer.extend_from_slice(&frame.sample_position.to_le_bytes());
+        send_buffer.extend_from_slice(&frame.transport_generation.to_le_bytes());
         send_buffer.extend_from_slice(header_data);
         send_buffer.extend_from_slice(&frame.data);
         let result = stream.write_all(send_buffer);
@@ -480,7 +486,7 @@ impl AudioProcessor {
         self.status.snapshot()
     }
 
-    pub fn add(&self, data: &[u8], ts: u64) {
+    pub fn add(&self, data: &[u8], sample_position: i64, transport_generation: u32) {
         let bytes_per_frame = usize::from(self.num_channels) * 3;
         if data.is_empty()
             || data.len() > self.max_frame_bytes
@@ -500,10 +506,10 @@ impl AudioProcessor {
         };
         buf.clear();
         buf.extend_from_slice(data);
-        self.enqueue_buffer(render.state, buf, ts);
+        self.enqueue_buffer(render.state, buf, sample_position, transport_generation);
     }
 
-    pub fn add_f32_mono(&self, samples: &[f32], ts: u64) {
+    pub fn add_f32_mono(&self, samples: &[f32], sample_position: i64, transport_generation: u32) {
         let frame_size = samples.len().saturating_mul(3);
         if self.num_channels != 1
             || samples.is_empty()
@@ -531,7 +537,7 @@ impl AudioProcessor {
             buf.push(((value >> 16) & 0xff) as u8);
         }
 
-        self.enqueue_buffer(render.state, buf, ts);
+        self.enqueue_buffer(render.state, buf, sample_position, transport_generation);
     }
 
     fn try_render_state(&self) -> Option<AudioProcessorRenderLease<'_>> {
@@ -558,9 +564,16 @@ impl AudioProcessor {
             .or_else(|| render.free_consumer.pop().ok())
     }
 
-    fn enqueue_buffer(&self, render: &mut AudioProcessorRenderState, buf: Vec<u8>, ts: u64) {
+    fn enqueue_buffer(
+        &self,
+        render: &mut AudioProcessorRenderState,
+        buf: Vec<u8>,
+        sample_position: i64,
+        transport_generation: u32,
+    ) {
         match render.data_producer.push(QueuedFrame {
-            pts_us: ts,
+            sample_position,
+            transport_generation,
             data: buf,
         }) {
             Ok(()) => {
@@ -768,10 +781,10 @@ impl AudioProcessorHandle {
         self.publish_and_reclaim(ptr::null_mut());
     }
 
-    pub fn add(&self, data: &[u8], ts: u64) {
+    pub fn add(&self, data: &[u8], sample_position: i64, transport_generation: u32) {
         let lease = self.acquire();
         if let Some(processor) = lease.processor() {
-            processor.add(data, ts);
+            processor.add(data, sample_position, transport_generation);
         }
     }
 
@@ -989,13 +1002,18 @@ pub extern "C" fn audio_processor_add(
     handle: *mut c_void,
     data_ptr: *const u8,
     length: usize,
-    ts: u64,
+    sample_position: i64,
+    transport_generation: u32,
 ) {
     if handle.is_null() || data_ptr.is_null() || length == 0 {
         return;
     }
     let data = unsafe { std::slice::from_raw_parts(data_ptr, length) };
-    unsafe { &*(handle as *mut AudioProcessorHandle) }.add(data, ts);
+    unsafe { &*(handle as *mut AudioProcessorHandle) }.add(
+        data,
+        sample_position,
+        transport_generation,
+    );
 }
 
 #[no_mangle]
@@ -1046,7 +1064,7 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     static SOCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1063,6 +1081,8 @@ mod tests {
     #[derive(Debug)]
     struct ReceivedFrame {
         header: FrameHeader,
+        sample_position: i64,
+        transport_generation: u32,
         audio_data: Vec<u8>,
     }
 
@@ -1093,8 +1113,8 @@ mod tests {
 
                     let mut hello_buf = [0u8; 4];
                     if stream.read_exact(&mut hello_buf).is_ok() {
-                        assert_eq!(&hello_buf, b"HELO", "Expected HELO handshake");
-                        println!("Server: Received HELO");
+                        assert_eq!(&hello_buf, b"AUD2", "Expected AUD2 handshake");
+                        println!("Server: Received AUD2");
 
                         stream.write_all(&1u16.to_le_bytes()).unwrap();
                         println!("Server: Sent frame ID");
@@ -1111,13 +1131,23 @@ mod tests {
                                 break;
                             }
 
-                            if let Ok(header) = FrameHeader::decode(&mut &frame_data[..]) {
+                            if frame_data.len() < SAMPLE_CLOCK_BYTES {
+                                break;
+                            }
+                            let sample_position =
+                                i64::from_le_bytes(frame_data[..8].try_into().unwrap());
+                            let transport_generation =
+                                u32::from_le_bytes(frame_data[8..12].try_into().unwrap());
+                            let encoded_frame = &frame_data[SAMPLE_CLOCK_BYTES..];
+                            if let Ok(header) = FrameHeader::decode(&mut &encoded_frame[..]) {
                                 let header_size = header.size();
-                                let audio_data = frame_data[header_size..].to_vec();
-                                frames
-                                    .lock()
-                                    .unwrap()
-                                    .push(ReceivedFrame { header, audio_data });
+                                let audio_data = encoded_frame[header_size..].to_vec();
+                                frames.lock().unwrap().push(ReceivedFrame {
+                                    header,
+                                    sample_position,
+                                    transport_generation,
+                                    audio_data,
+                                });
                             }
                         }
                     }
@@ -1170,16 +1200,11 @@ mod tests {
             test_data[i + 5] = 0xBC;
         }
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as u64;
-
-        audio_processor_add(processor, test_data.as_ptr(), test_data.len(), now);
+        audio_processor_add(processor, test_data.as_ptr(), test_data.len(), 48_000, 1);
         thread::sleep(Duration::from_millis(500));
-        audio_processor_add(processor, test_data.as_ptr(), test_data.len(), now);
+        audio_processor_add(processor, test_data.as_ptr(), test_data.len(), 48_010, 1);
         thread::sleep(Duration::from_millis(500));
-        audio_processor_add(processor, test_data.as_ptr(), test_data.len(), now);
+        audio_processor_add(processor, test_data.as_ptr(), test_data.len(), 48_020, 1);
 
         let frames = received_frames.lock().unwrap();
         assert!(!frames.is_empty(), "No frames received");
@@ -1196,6 +1221,9 @@ mod tests {
             48_000,
             "Expected 48kHz sample rate"
         );
+        assert_eq!(first_frame.header.pts(), None);
+        assert_eq!(first_frame.sample_position, 48_000);
+        assert_eq!(first_frame.transport_generation, 1);
         assert_eq!(
             first_frame.audio_data.len(),
             3 * 2 * num_samples,
@@ -1230,14 +1258,16 @@ mod tests {
         let received_frames = server.start();
         let mut processor = AudioProcessor::new(SOCKET_PATH.to_string(), 1, 48_000);
 
-        processor.add_f32_mono(&[-1.0, 0.0, 1.0], 5_000);
+        processor.add_f32_mono(&[-1.0, 0.0, 1.0], -120, 7);
         thread::sleep(Duration::from_millis(250));
 
         let frames = received_frames.lock().unwrap();
         let frame = frames.first().expect("mobile PCM frame");
         assert_eq!(frame.header.sample_size(), 3);
         assert_eq!(frame.header.channels(), 1);
-        assert_eq!(frame.header.pts(), Some(5_000));
+        assert_eq!(frame.header.pts(), None);
+        assert_eq!(frame.sample_position, -120);
+        assert_eq!(frame.transport_generation, 7);
         assert_eq!(
             frame.audio_data,
             vec![0x01, 0x00, 0x80, 0x00, 0x00, 0x00, 0xff, 0xff, 0x7f]
@@ -1257,7 +1287,7 @@ mod tests {
         wait_until(Duration::from_secs(1), || processor.status().connected);
         for (index, frames) in [64usize, 512, 17].into_iter().enumerate() {
             let data = vec![index as u8 + 1; frames * 2 * 3];
-            processor.add(&data, 10_000 + index as u64);
+            processor.add(&data, 10_000 + index as i64, 4);
             wait_until(Duration::from_secs(1), || {
                 received_frames.lock().unwrap().len() == index + 1
             });
@@ -1281,9 +1311,9 @@ mod tests {
         assert_eq!(
             frames
                 .iter()
-                .map(|frame| frame.header.pts())
+                .map(|frame| frame.sample_position)
                 .collect::<Vec<_>>(),
-            vec![Some(10_000), Some(10_001), Some(10_002)]
+            vec![10_000, 10_001, 10_002]
         );
         drop(frames);
         processor.shutdown();
@@ -1297,8 +1327,8 @@ mod tests {
         assert!(processor.status().started);
 
         let data = vec![0x7f; 64 * 2 * 3];
-        for pts in 0..(RING_SIZE as u64 + 5) {
-            processor.add(&data, pts);
+        for sample_position in 0..(RING_SIZE as i64 + 5) {
+            processor.add(&data, sample_position, 1);
         }
 
         let status = processor.status();
@@ -1314,11 +1344,12 @@ mod tests {
         let (mut free_producer, mut free_consumer) = RingBuffer::<Vec<u8>>::new(RING_SIZE);
         let status = AudioProcessorStatusCounters::default();
 
-        for pts_us in [5_000, 10_000, 15_000] {
+        for sample_position in [240, 480, 720] {
             producer
                 .push(QueuedFrame {
-                    pts_us,
-                    data: vec![(pts_us / 5_000) as u8; 12],
+                    sample_position,
+                    transport_generation: 3,
+                    data: vec![(sample_position / 240) as u8; 12],
                 })
                 .expect("test queue has capacity");
         }
@@ -1326,7 +1357,8 @@ mod tests {
         let live = AudioProcessor::take_live_edge(&mut consumer, &mut free_producer, &status)
             .expect("newest frame");
 
-        assert_eq!(live.pts_us, 15_000);
+        assert_eq!(live.sample_position, 720);
+        assert_eq!(live.transport_generation, 3);
         assert_eq!(live.data, vec![3; 12]);
         assert_eq!(status.frames_dropped.load(Ordering::Relaxed), 2);
         assert_eq!(
@@ -1387,14 +1419,14 @@ mod tests {
             let render_calls = Arc::clone(&render_calls);
             thread::spawn(move || {
                 let data = vec![0x5a; 128 * 2 * 3];
-                handle.add(&data, 0);
+                handle.add(&data, 0, 1);
                 render_calls.fetch_add(1, Ordering::Relaxed);
                 start.wait();
-                let mut pts = 1u64;
+                let mut sample_position = 1i64;
                 while !stop.load(Ordering::Acquire) {
-                    handle.add(&data, pts);
+                    handle.add(&data, sample_position, 1);
                     render_calls.fetch_add(1, Ordering::Relaxed);
-                    pts += 1;
+                    sample_position += 1;
                     thread::yield_now();
                 }
             })
