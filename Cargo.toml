@@ -3,10 +3,15 @@ name = "au-tx"
 version = "0.2.0"
 edition = "2021"
 
+[workspace]
+members = [".", "crates/archive-webrtc"]
+resolver = "2"
+
 [lib]
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
+archive-webrtc = { path = "crates/archive-webrtc" }
 ctrlc = "3.4.5"
 gen-id = "0.2.1"
 rtrb = "0.3.1"

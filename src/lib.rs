@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+pub use archive_webrtc::*;
+
 const BITS_PER_SAMPLE: u8 = 24;
 const RECONNECT_INTERVAL: Duration = Duration::from_millis(50);
 const METADATA_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);

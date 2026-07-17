@@ -1,0 +1,11 @@
+[package]
+name = "archive-webrtc"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+matchbox_socket = { git = "https://github.com/wavey-ai/matchbox", rev = "fdc13910db5bea6e679b5336df2ac077c89883c7" }
+tokio = { version = "1.52.0", features = ["rt-multi-thread", "time"] }
