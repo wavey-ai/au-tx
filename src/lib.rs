@@ -2,8 +2,10 @@ use frame_header::{EncodingFlag, Endianness, FrameHeader};
 use rtrb::{Consumer, Producer, PushError, RingBuffer};
 use std::cell::UnsafeCell;
 use std::ffi::{c_char, c_void, CStr};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -17,16 +19,24 @@ const METADATA_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 // ever allocating on the render thread. The worker coalesces every accumulated
 // burst to its newest quantum before writing, so this capacity is an outage
 // cushion rather than an 85 ms FIFO playout queue.
-const RING_SIZE: usize = 16;
+const RING_SIZE: usize = 128;
 const DEFAULT_MAX_FRAMES: usize = 4095;
 const MAX_HEADER_BYTES: usize = 20;
 const SAMPLE_CLOCK_BYTES: usize = 12;
 const MAX_METADATA_FIELD_BYTES: usize = 512;
+const ARCHIVE_CHUNK_MAGIC: &[u8; 4] = b"IAR1";
+const ARCHIVE_CHUNK_VERSION: u16 = 1;
+const ARCHIVE_CHUNK_HEADER_BYTES: u16 = 52;
+const ARCHIVE_FLAG_DISCONTINUITY: u8 = 1;
+const DEFAULT_ARCHIVE_QUOTA_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MIN_ARCHIVE_QUOTA_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_ARCHIVE_QUOTA_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 #[derive(Debug)]
 struct QueuedFrame {
     sample_position: i64,
     transport_generation: u32,
+    archive_capture: bool,
     data: Vec<u8>,
 }
 
@@ -34,6 +44,27 @@ struct QueuedFrame {
 struct TrackMetadata {
     instance_id: Option<String>,
     label: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ArchiveConfig {
+    directory: Option<PathBuf>,
+    quota_bytes: u64,
+    enabled: bool,
+}
+
+impl ArchiveConfig {
+    fn normalized(directory: PathBuf, quota_bytes: u64) -> Self {
+        Self {
+            directory: Some(directory),
+            quota_bytes: if quota_bytes == 0 {
+                DEFAULT_ARCHIVE_QUOTA_BYTES
+            } else {
+                quota_bytes.clamp(MIN_ARCHIVE_QUOTA_BYTES, MAX_ARCHIVE_QUOTA_BYTES)
+            },
+            enabled: false,
+        }
+    }
 }
 
 impl TrackMetadata {
@@ -54,6 +85,363 @@ pub struct AudioProcessorStatus {
     pub connection_failures: u64,
     pub last_connected_unix_ms: u64,
     pub last_send_unix_ms: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AudioProcessorArchiveStatus {
+    pub enabled: bool,
+    pub flush_complete: bool,
+    pub spool_full: bool,
+    pub chunks_spooled: u64,
+    pub bytes_spooled: u64,
+    pub frames_spooled: u64,
+    pub frames_lost: u64,
+    pub last_spool_unix_ms: u64,
+}
+
+#[derive(Debug, Default)]
+struct ArchiveStatusCounters {
+    flush_complete: AtomicBool,
+    spool_full: AtomicBool,
+    chunks_spooled: AtomicU64,
+    bytes_spooled: AtomicU64,
+    frames_spooled: AtomicU64,
+    frames_lost: AtomicU64,
+    last_spool_unix_ms: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct ArchiveControl {
+    config: RwLock<ArchiveConfig>,
+    capture_enabled: AtomicBool,
+    version: AtomicU64,
+    status: ArchiveStatusCounters,
+}
+
+impl ArchiveControl {
+    fn configure(&self, config: ArchiveConfig) {
+        self.capture_enabled
+            .store(config.enabled, Ordering::Release);
+        let mut current = self
+            .config
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *current == config {
+            return;
+        }
+        *current = config;
+        self.status.flush_complete.store(false, Ordering::Release);
+        self.status.spool_full.store(false, Ordering::Release);
+        self.version.fetch_add(1, Ordering::Release);
+    }
+
+    fn set_enabled(&self, enabled: bool) {
+        self.capture_enabled.store(enabled, Ordering::Release);
+        let mut current = self
+            .config
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current.enabled == enabled {
+            return;
+        }
+        current.enabled = enabled;
+        self.status.flush_complete.store(false, Ordering::Release);
+        self.status.spool_full.store(false, Ordering::Release);
+        self.version.fetch_add(1, Ordering::Release);
+    }
+
+    fn snapshot(&self) -> AudioProcessorArchiveStatus {
+        let enabled = self
+            .config
+            .read()
+            .map(|config| config.enabled)
+            .unwrap_or(false);
+        AudioProcessorArchiveStatus {
+            enabled,
+            flush_complete: self.status.flush_complete.load(Ordering::Acquire),
+            spool_full: self.status.spool_full.load(Ordering::Acquire),
+            chunks_spooled: self.status.chunks_spooled.load(Ordering::Acquire),
+            bytes_spooled: self.status.bytes_spooled.load(Ordering::Acquire),
+            frames_spooled: self.status.frames_spooled.load(Ordering::Acquire),
+            frames_lost: self.status.frames_lost.load(Ordering::Acquire),
+            last_spool_unix_ms: self.status.last_spool_unix_ms.load(Ordering::Acquire),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PendingArchiveChunk {
+    sequence: u64,
+    sample_position: i64,
+    transport_generation: u32,
+    frame_count: u32,
+    flags: u8,
+    pcm: Vec<u8>,
+}
+
+struct ArchiveSpoolWriter {
+    control: Arc<ArchiveControl>,
+    config_version: u64,
+    directory: Option<PathBuf>,
+    quota_bytes: u64,
+    enabled: bool,
+    next_sequence: u64,
+    pending_gap: bool,
+    pending: PendingArchiveChunk,
+    num_channels: u8,
+    sample_rate: u32,
+}
+
+impl ArchiveSpoolWriter {
+    fn new(control: Arc<ArchiveControl>, num_channels: u8, sample_rate: u32) -> Self {
+        Self {
+            control,
+            config_version: u64::MAX,
+            directory: None,
+            quota_bytes: DEFAULT_ARCHIVE_QUOTA_BYTES,
+            enabled: false,
+            next_sequence: 1,
+            pending_gap: false,
+            pending: PendingArchiveChunk::default(),
+            num_channels,
+            sample_rate,
+        }
+    }
+
+    fn sync_config(&mut self) {
+        let version = self.control.version.load(Ordering::Acquire);
+        if version == self.config_version {
+            return;
+        }
+
+        let config = self
+            .control
+            .config
+            .read()
+            .map(|config| config.clone())
+            .unwrap_or_default();
+        let directory_changed = config.directory != self.directory;
+        if directory_changed {
+            self.finish_pending();
+        }
+
+        self.directory = config.directory;
+        self.quota_bytes = config.quota_bytes.max(MIN_ARCHIVE_QUOTA_BYTES);
+        self.enabled = config.enabled && self.directory.is_some();
+        if directory_changed {
+            self.next_sequence = self
+                .directory
+                .as_deref()
+                .map(next_archive_sequence)
+                .unwrap_or(1);
+            self.pending = PendingArchiveChunk::default();
+            self.pending_gap = false;
+        }
+        self.config_version = version;
+    }
+
+    fn push(&mut self, frame: &QueuedFrame) {
+        self.sync_config();
+        if !frame.archive_capture || self.directory.is_none() {
+            return;
+        }
+
+        let bytes_per_frame = usize::from(self.num_channels) * 3;
+        if frame.data.is_empty() || !frame.data.len().is_multiple_of(bytes_per_frame) {
+            return;
+        }
+
+        let total_frames = frame.data.len() / bytes_per_frame;
+        let expected_position = self
+            .pending
+            .sample_position
+            .saturating_add(i64::from(self.pending.frame_count));
+        if self.pending.frame_count > 0
+            && (self.pending.transport_generation != frame.transport_generation
+                || expected_position != frame.sample_position)
+        {
+            self.finish_pending();
+            self.pending_gap = true;
+        }
+
+        let mut source_frame_offset = 0usize;
+        while source_frame_offset < total_frames {
+            if self.pending.frame_count == 0 {
+                self.pending.sequence = self.next_sequence;
+                self.pending.sample_position = frame
+                    .sample_position
+                    .saturating_add(source_frame_offset.min(i64::MAX as usize) as i64);
+                self.pending.transport_generation = frame.transport_generation;
+                self.pending.flags = if self.pending_gap {
+                    ARCHIVE_FLAG_DISCONTINUITY
+                } else {
+                    0
+                };
+                self.pending_gap = false;
+            }
+
+            let target_frames = self.sample_rate as usize;
+            let pending_frames = self.pending.frame_count as usize;
+            let copied_frames =
+                (target_frames - pending_frames).min(total_frames - source_frame_offset);
+            let byte_start = source_frame_offset * bytes_per_frame;
+            let byte_end = byte_start + copied_frames * bytes_per_frame;
+            self.pending
+                .pcm
+                .extend_from_slice(&frame.data[byte_start..byte_end]);
+            self.pending.frame_count = self
+                .pending
+                .frame_count
+                .saturating_add(copied_frames as u32);
+            source_frame_offset += copied_frames;
+
+            if self.pending.frame_count as usize == target_frames {
+                self.finish_pending();
+            }
+        }
+    }
+
+    fn finish_capture_if_stopped(&mut self) {
+        self.sync_config();
+        if self.enabled {
+            return;
+        }
+        self.finish_pending();
+        self.control
+            .status
+            .flush_complete
+            .store(true, Ordering::Release);
+    }
+
+    fn finish_pending(&mut self) {
+        if self.pending.frame_count == 0 {
+            return;
+        }
+
+        let frame_count = u64::from(self.pending.frame_count);
+        let result = self.write_pending();
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.pending = PendingArchiveChunk::default();
+        match result {
+            Ok(file_bytes) => {
+                self.control
+                    .status
+                    .spool_full
+                    .store(false, Ordering::Release);
+                self.control
+                    .status
+                    .chunks_spooled
+                    .fetch_add(1, Ordering::Relaxed);
+                self.control
+                    .status
+                    .bytes_spooled
+                    .fetch_add(file_bytes, Ordering::Relaxed);
+                self.control
+                    .status
+                    .frames_spooled
+                    .fetch_add(frame_count, Ordering::Relaxed);
+                self.control
+                    .status
+                    .last_spool_unix_ms
+                    .store(now_unix_ms(), Ordering::Release);
+            }
+            Err(error) => {
+                if error.kind() == std::io::ErrorKind::StorageFull {
+                    self.control
+                        .status
+                        .spool_full
+                        .store(true, Ordering::Release);
+                }
+                self.control
+                    .status
+                    .frames_lost
+                    .fetch_add(frame_count, Ordering::Relaxed);
+                self.pending_gap = true;
+            }
+        }
+    }
+
+    fn write_pending(&self) -> Result<u64, std::io::Error> {
+        let directory = self.directory.as_deref().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "archive directory missing")
+        })?;
+        fs::create_dir_all(directory)?;
+
+        let file_bytes =
+            u64::from(ARCHIVE_CHUNK_HEADER_BYTES).saturating_add(self.pending.pcm.len() as u64);
+        let existing_bytes = archive_directory_bytes(directory)?;
+        if existing_bytes.saturating_add(file_bytes) > self.quota_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "archive spool quota reached",
+            ));
+        }
+
+        let stem = format!("{:020}", self.pending.sequence);
+        let partial_path = directory.join(format!("{stem}.partial"));
+        let final_path = directory.join(format!("{stem}.iarc"));
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&partial_path)?;
+        file.write_all(ARCHIVE_CHUNK_MAGIC)?;
+        file.write_all(&ARCHIVE_CHUNK_VERSION.to_le_bytes())?;
+        file.write_all(&ARCHIVE_CHUNK_HEADER_BYTES.to_le_bytes())?;
+        file.write_all(&self.pending.sequence.to_le_bytes())?;
+        file.write_all(&self.pending.sample_position.to_le_bytes())?;
+        file.write_all(&self.pending.transport_generation.to_le_bytes())?;
+        file.write_all(&self.sample_rate.to_le_bytes())?;
+        file.write_all(&self.pending.frame_count.to_le_bytes())?;
+        file.write_all(&(self.pending.pcm.len() as u32).to_le_bytes())?;
+        file.write_all(&u16::from(self.num_channels).to_le_bytes())?;
+        file.write_all(&[BITS_PER_SAMPLE, self.pending.flags])?;
+        file.write_all(&now_unix_ms().to_le_bytes())?;
+        file.write_all(&self.pending.pcm)?;
+        file.sync_all()?;
+        fs::rename(&partial_path, &final_path)?;
+        File::open(directory)?.sync_all()?;
+        Ok(file_bytes)
+    }
+}
+
+impl Drop for ArchiveSpoolWriter {
+    fn drop(&mut self) {
+        self.finish_pending();
+    }
+}
+
+fn next_archive_sequence(directory: &Path) -> u64 {
+    fs::read_dir(directory)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            (path.extension().and_then(|value| value.to_str()) == Some("iarc"))
+                .then(|| path.file_stem()?.to_str()?.parse::<u64>().ok())
+                .flatten()
+        })
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+}
+
+fn archive_directory_bytes(directory: &Path) -> Result<u64, std::io::Error> {
+    let mut total = 0u64;
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if matches!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("iarc" | "partial")
+        ) {
+            total = total.saturating_add(entry.metadata()?.len());
+        }
+    }
+    Ok(total)
 }
 
 #[derive(Debug, Default)]
@@ -143,6 +531,7 @@ pub struct AudioProcessor {
     status: Arc<AudioProcessorStatusCounters>,
     metadata: Arc<RwLock<TrackMetadata>>,
     metadata_version: Arc<AtomicU64>,
+    archive: Arc<ArchiveControl>,
     tx_thread: Option<JoinHandle<()>>,
     tx_waker: thread::Thread,
     num_channels: u8,
@@ -217,11 +606,13 @@ impl AudioProcessor {
         status.started.store(true, Ordering::Release);
         let metadata = Arc::new(RwLock::new(TrackMetadata::default()));
         let metadata_version = Arc::new(AtomicU64::new(0));
+        let archive = Arc::new(ArchiveControl::default());
 
         let worker_shutdown = Arc::clone(&shutdown);
         let worker_status = Arc::clone(&status);
         let worker_metadata = Arc::clone(&metadata);
         let worker_metadata_version = Arc::clone(&metadata_version);
+        let worker_archive = Arc::clone(&archive);
         let worker_socket_path = socket_path.clone();
         let tx_thread = thread::Builder::new()
             .name("infidelity-au-tx".to_owned())
@@ -236,6 +627,7 @@ impl AudioProcessor {
                     worker_status,
                     worker_metadata,
                     worker_metadata_version,
+                    worker_archive,
                     data_consumer,
                     free_producer,
                 );
@@ -255,6 +647,7 @@ impl AudioProcessor {
             status,
             metadata,
             metadata_version,
+            archive,
             tx_thread: Some(tx_thread),
             tx_waker,
             num_channels,
@@ -275,6 +668,7 @@ impl AudioProcessor {
         status: Arc<AudioProcessorStatusCounters>,
         metadata: Arc<RwLock<TrackMetadata>>,
         metadata_version: Arc<AtomicU64>,
+        archive_writer: &mut ArchiveSpoolWriter,
     ) -> Result<(), std::io::Error> {
         stream.write_all(b"AUD2")?;
 
@@ -305,7 +699,8 @@ impl AudioProcessor {
 
         // Reconnection is a live-edge operation. Never replay the AU backlog
         // accumulated while Nexus was unavailable; retain only the newest frame.
-        if let Some(frame) = Self::take_live_edge(consumer, free_producer, &status) {
+        if let Some(frame) = Self::take_live_edge(consumer, free_producer, &status, archive_writer)
+        {
             Self::send_frame(
                 &mut stream,
                 frame,
@@ -338,23 +733,24 @@ impl AudioProcessor {
                 }
             }
 
-            let sent_audio =
-                if let Some(frame) = Self::take_live_edge(consumer, free_producer, &status) {
-                    Self::send_frame(
-                        &mut stream,
-                        frame,
-                        id,
-                        num_channels,
-                        sample_rate,
-                        &mut header_data,
-                        &mut send_buffer,
-                        free_producer,
-                        &status,
-                    )?;
-                    true
-                } else {
-                    false
-                };
+            let sent_audio = if let Some(frame) =
+                Self::take_live_edge(consumer, free_producer, &status, archive_writer)
+            {
+                Self::send_frame(
+                    &mut stream,
+                    frame,
+                    id,
+                    num_channels,
+                    sample_rate,
+                    &mut header_data,
+                    &mut send_buffer,
+                    free_producer,
+                    &status,
+                )?;
+                true
+            } else {
+                false
+            };
 
             if shutdown.load(Ordering::Acquire) {
                 return Ok(());
@@ -380,13 +776,20 @@ impl AudioProcessor {
         consumer: &mut Consumer<QueuedFrame>,
         free_producer: &mut Producer<Vec<u8>>,
         status: &AudioProcessorStatusCounters,
+        archive_writer: &mut ArchiveSpoolWriter,
     ) -> Option<QueuedFrame> {
-        let mut newest = consumer.pop().ok()?;
+        let Some(mut newest) = consumer.pop().ok() else {
+            archive_writer.finish_capture_if_stopped();
+            return None;
+        };
+        archive_writer.push(&newest);
         while let Ok(frame) = consumer.pop() {
+            archive_writer.push(&frame);
             let stale = std::mem::replace(&mut newest, frame);
             let _ = free_producer.push(stale.data);
             status.frames_dropped.fetch_add(1, Ordering::Relaxed);
         }
+        archive_writer.finish_capture_if_stopped();
         Some(newest)
     }
 
@@ -486,6 +889,25 @@ impl AudioProcessor {
         self.status.snapshot()
     }
 
+    fn configure_archive(&self, config: ArchiveConfig) {
+        self.archive.configure(config);
+        self.tx_waker.unpark();
+    }
+
+    pub fn set_archive_enabled(&self, enabled: bool) {
+        self.archive.set_enabled(enabled);
+        if !enabled {
+            while self.render_active.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+        }
+        self.tx_waker.unpark();
+    }
+
+    pub fn archive_status(&self) -> AudioProcessorArchiveStatus {
+        self.archive.snapshot()
+    }
+
     pub fn add(&self, data: &[u8], sample_position: i64, transport_generation: u32) {
         let bytes_per_frame = usize::from(self.num_channels) * 3;
         if data.is_empty()
@@ -574,6 +996,7 @@ impl AudioProcessor {
         match render.data_producer.push(QueuedFrame {
             sample_position,
             transport_generation,
+            archive_capture: self.archive.capture_enabled.load(Ordering::Acquire),
             data: buf,
         }) {
             Ok(()) => {
@@ -612,10 +1035,13 @@ impl AudioProcessor {
         status: Arc<AudioProcessorStatusCounters>,
         metadata: Arc<RwLock<TrackMetadata>>,
         metadata_version: Arc<AtomicU64>,
+        archive: Arc<ArchiveControl>,
         mut data_consumer: Consumer<QueuedFrame>,
         mut free_producer: Producer<Vec<u8>>,
     ) {
+        let mut archive_writer = ArchiveSpoolWriter::new(archive, num_channels, sample_rate);
         while !shutdown.load(Ordering::Acquire) {
+            archive_writer.sync_config();
             status.connection_attempts.fetch_add(1, Ordering::Relaxed);
             match Self::establish_connection(&socket_path) {
                 Some(stream) => {
@@ -632,6 +1058,7 @@ impl AudioProcessor {
                         Arc::clone(&status),
                         Arc::clone(&metadata),
                         Arc::clone(&metadata_version),
+                        &mut archive_writer,
                     )
                     .is_err()
                     {
@@ -640,6 +1067,11 @@ impl AudioProcessor {
                 }
                 None => {
                     status.connection_failures.fetch_add(1, Ordering::Relaxed);
+                    while let Ok(frame) = data_consumer.pop() {
+                        archive_writer.push(&frame);
+                        let _ = free_producer.push(frame.data);
+                    }
+                    archive_writer.finish_capture_if_stopped();
                 }
             }
             status.connected.store(false, Ordering::Release);
@@ -649,6 +1081,7 @@ impl AudioProcessor {
         }
         status.connected.store(false, Ordering::Release);
         status.started.store(false, Ordering::Release);
+        archive_writer.finish_pending();
     }
 
     fn request_shutdown(&self) {
@@ -708,6 +1141,7 @@ pub struct AudioProcessorHandle {
     reader_counts: [AtomicUsize; 2],
     lifecycle: Mutex<()>,
     desired_metadata: Mutex<TrackMetadata>,
+    desired_archive: Mutex<ArchiveConfig>,
 }
 
 impl Default for AudioProcessorHandle {
@@ -718,6 +1152,7 @@ impl Default for AudioProcessorHandle {
             reader_counts: [AtomicUsize::new(0), AtomicUsize::new(0)],
             lifecycle: Mutex::new(()),
             desired_metadata: Mutex::new(TrackMetadata::default()),
+            desired_archive: Mutex::new(ArchiveConfig::default()),
         }
     }
 }
@@ -754,6 +1189,12 @@ impl AudioProcessorHandle {
             initial_metadata.instance_id.clone(),
             initial_metadata.label.clone(),
         );
+        let initial_archive = self
+            .desired_archive
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        processor.configure_archive(initial_archive);
         let processor = Box::into_raw(processor);
 
         let _lifecycle = self
@@ -771,6 +1212,12 @@ impl AudioProcessorHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         unsafe { &*processor }
             .set_track_metadata(desired.instance_id.clone(), desired.label.clone());
+        let desired_archive = self
+            .desired_archive
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        unsafe { &*processor }.configure_archive(desired_archive);
     }
 
     pub fn deinitialize(&self) {
@@ -808,6 +1255,53 @@ impl AudioProcessorHandle {
         if let Some(processor) = lease.processor() {
             processor.set_track_metadata(desired.instance_id.clone(), desired.label.clone());
         }
+    }
+
+    pub fn configure_archive(&self, directory: PathBuf, quota_bytes: u64) {
+        let mut desired = self
+            .desired_archive
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let enabled = desired.enabled;
+        *desired = ArchiveConfig::normalized(directory, quota_bytes);
+        desired.enabled = enabled;
+
+        let lease = self.acquire();
+        if let Some(processor) = lease.processor() {
+            processor.configure_archive(desired.clone());
+        }
+    }
+
+    pub fn set_archive_enabled(&self, enabled: bool) {
+        let mut desired = self
+            .desired_archive
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        desired.enabled = enabled;
+
+        let lease = self.acquire();
+        if let Some(processor) = lease.processor() {
+            processor.set_archive_enabled(enabled);
+        }
+    }
+
+    pub fn archive_status(&self) -> AudioProcessorArchiveStatus {
+        let lease = self.acquire();
+        lease
+            .processor()
+            .map(AudioProcessor::archive_status)
+            .unwrap_or_else(|| {
+                let enabled = self
+                    .desired_archive
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .enabled;
+                AudioProcessorArchiveStatus {
+                    enabled,
+                    flush_complete: !enabled,
+                    ..AudioProcessorArchiveStatus::default()
+                }
+            })
     }
 
     pub fn copy_desired_metadata_from(&self, source: &Self) {
@@ -889,6 +1383,16 @@ fn socket_path_from_c(socket_path: *const c_char) -> Option<String> {
             .to_string_lossy()
             .into_owned(),
     )
+}
+
+fn path_from_c(path: *const c_char) -> Option<PathBuf> {
+    let value = socket_path_from_c(path)?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(trimmed))
+    }
 }
 
 fn new_initialized_processor_handle(
@@ -1039,6 +1543,40 @@ pub extern "C" fn audio_processor_set_track_metadata(
     }
 }
 
+#[no_mangle]
+pub extern "C" fn audio_processor_archive_configure(
+    handle: *mut c_void,
+    spool_directory: *const c_char,
+    quota_bytes: u64,
+) -> bool {
+    if handle.is_null() {
+        return false;
+    }
+    let Some(directory) = path_from_c(spool_directory) else {
+        return false;
+    };
+    unsafe { &*(handle as *mut AudioProcessorHandle) }.configure_archive(directory, quota_bytes);
+    true
+}
+
+#[no_mangle]
+pub extern "C" fn audio_processor_archive_set_enabled(handle: *mut c_void, enabled: bool) {
+    if !handle.is_null() {
+        unsafe { &*(handle as *mut AudioProcessorHandle) }.set_archive_enabled(enabled);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn audio_processor_archive_status(
+    handle: *mut c_void,
+) -> AudioProcessorArchiveStatus {
+    if handle.is_null() {
+        AudioProcessorArchiveStatus::default()
+    } else {
+        unsafe { &*(handle as *mut AudioProcessorHandle) }.archive_status()
+    }
+}
+
 /// Deinitializes the current inner processor but leaves the stable handle and
 /// its desired metadata valid for a later initialize.
 #[no_mangle]
@@ -1076,6 +1614,16 @@ mod tests {
             now_unix_ms(),
             counter
         )
+    }
+
+    fn unique_archive_path() -> PathBuf {
+        let counter = SOCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "au-tx-archive-{}-{}-{}",
+            std::process::id(),
+            now_unix_ms(),
+            counter
+        ))
     }
 
     #[derive(Debug)]
@@ -1343,19 +1891,27 @@ mod tests {
         let (mut producer, mut consumer) = RingBuffer::<QueuedFrame>::new(RING_SIZE);
         let (mut free_producer, mut free_consumer) = RingBuffer::<Vec<u8>>::new(RING_SIZE);
         let status = AudioProcessorStatusCounters::default();
+        let mut archive_writer =
+            ArchiveSpoolWriter::new(Arc::new(ArchiveControl::default()), 2, 48_000);
 
         for sample_position in [240, 480, 720] {
             producer
                 .push(QueuedFrame {
                     sample_position,
                     transport_generation: 3,
+                    archive_capture: false,
                     data: vec![(sample_position / 240) as u8; 12],
                 })
                 .expect("test queue has capacity");
         }
 
-        let live = AudioProcessor::take_live_edge(&mut consumer, &mut free_producer, &status)
-            .expect("newest frame");
+        let live = AudioProcessor::take_live_edge(
+            &mut consumer,
+            &mut free_producer,
+            &status,
+            &mut archive_writer,
+        )
+        .expect("newest frame");
 
         assert_eq!(live.sample_position, 720);
         assert_eq!(live.transport_generation, 3);
@@ -1370,6 +1926,143 @@ mod tests {
             vec![2; 12]
         );
         assert!(consumer.pop().is_err());
+    }
+
+    #[test]
+    fn archive_spool_batches_exact_sample_clock_chunks_atomically() {
+        let directory = unique_archive_path();
+        let control = Arc::new(ArchiveControl::default());
+        control.configure(ArchiveConfig {
+            directory: Some(directory.clone()),
+            quota_bytes: MIN_ARCHIVE_QUOTA_BYTES,
+            enabled: true,
+        });
+        let mut writer = ArchiveSpoolWriter::new(Arc::clone(&control), 2, 8);
+
+        writer.push(&QueuedFrame {
+            sample_position: -3,
+            transport_generation: 7,
+            archive_capture: true,
+            data: vec![0x11; 3 * 2 * 3],
+        });
+        writer.push(&QueuedFrame {
+            sample_position: 0,
+            transport_generation: 7,
+            archive_capture: true,
+            data: vec![0x22; 5 * 2 * 3],
+        });
+
+        let path = directory.join("00000000000000000001.iarc");
+        let bytes = fs::read(&path).expect("committed archive chunk");
+        assert_eq!(&bytes[0..4], ARCHIVE_CHUNK_MAGIC);
+        assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 1);
+        assert_eq!(u16::from_le_bytes(bytes[6..8].try_into().unwrap()), 52);
+        assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), 1);
+        assert_eq!(i64::from_le_bytes(bytes[16..24].try_into().unwrap()), -3);
+        assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 7);
+        assert_eq!(u32::from_le_bytes(bytes[28..32].try_into().unwrap()), 8);
+        assert_eq!(u32::from_le_bytes(bytes[32..36].try_into().unwrap()), 8);
+        assert_eq!(u32::from_le_bytes(bytes[36..40].try_into().unwrap()), 48);
+        assert_eq!(u16::from_le_bytes(bytes[40..42].try_into().unwrap()), 2);
+        assert_eq!(bytes[42], 24);
+        assert_eq!(bytes[43], 0);
+        assert_eq!(&bytes[52..70], vec![0x11; 18]);
+        assert_eq!(&bytes[70..], vec![0x22; 30]);
+        assert!(!directory.join("00000000000000000001.partial").exists());
+        let status = control.snapshot();
+        assert_eq!(status.chunks_spooled, 1);
+        assert_eq!(status.frames_spooled, 8);
+        assert!(!status.spool_full);
+
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn archive_spool_marks_discontinuity_and_recovers_sequence() {
+        let directory = unique_archive_path();
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("00000000000000000007.iarc"), b"prior").unwrap();
+        assert_eq!(next_archive_sequence(&directory), 8);
+
+        let control = Arc::new(ArchiveControl::default());
+        control.configure(ArchiveConfig {
+            directory: Some(directory.clone()),
+            quota_bytes: MIN_ARCHIVE_QUOTA_BYTES,
+            enabled: true,
+        });
+        let mut writer = ArchiveSpoolWriter::new(Arc::clone(&control), 1, 8);
+        writer.push(&QueuedFrame {
+            sample_position: 0,
+            transport_generation: 1,
+            archive_capture: true,
+            data: vec![0x10; 4 * 3],
+        });
+        writer.push(&QueuedFrame {
+            sample_position: 100,
+            transport_generation: 2,
+            archive_capture: true,
+            data: vec![0x20; 8 * 3],
+        });
+        writer.finish_pending();
+
+        let first = fs::read(directory.join("00000000000000000008.iarc")).unwrap();
+        let second = fs::read(directory.join("00000000000000000009.iarc")).unwrap();
+        assert_eq!(i64::from_le_bytes(first[16..24].try_into().unwrap()), 0);
+        assert_eq!(first[43], 0);
+        assert_eq!(i64::from_le_bytes(second[16..24].try_into().unwrap()), 100);
+        assert_eq!(u32::from_le_bytes(second[24..28].try_into().unwrap()), 2);
+        assert_eq!(second[43], ARCHIVE_FLAG_DISCONTINUITY);
+        assert_eq!(control.snapshot().chunks_spooled, 2);
+
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn archive_stop_flushes_only_render_quanta_inside_the_capture_boundary() {
+        let directory = unique_archive_path();
+        let socket_path = unique_socket_path();
+        let mut processor = AudioProcessor::new_preallocated(socket_path, 1, 48_000, 8);
+        processor.configure_archive(ArchiveConfig {
+            directory: Some(directory.clone()),
+            quota_bytes: MIN_ARCHIVE_QUOTA_BYTES,
+            enabled: false,
+        });
+
+        processor.add(&vec![0x10; 2 * 3], -2, 1);
+        processor.set_archive_enabled(true);
+        let captured = vec![0x20; 4 * 3];
+        processor.add(&captured, 0, 1);
+        processor.set_archive_enabled(false);
+        processor.add(&vec![0x30; 2 * 3], 4, 1);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !processor.archive_status().flush_complete && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let status = processor.archive_status();
+        assert!(status.flush_complete);
+        assert!(!status.enabled);
+        assert_eq!(status.frames_spooled, 4);
+
+        let chunk = fs::read(directory.join("00000000000000000001.iarc"))
+            .expect("final partial archive chunk");
+        assert_eq!(i64::from_le_bytes(chunk[16..24].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(chunk[32..36].try_into().unwrap()), 4);
+        assert_eq!(&chunk[52..], captured);
+        assert_eq!(
+            fs::read_dir(&directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(
+                    |entry| entry.path().extension().and_then(|value| value.to_str())
+                        == Some("iarc")
+                )
+                .count(),
+            1
+        );
+
+        processor.shutdown();
+        fs::remove_dir_all(directory).ok();
     }
 
     #[test]
