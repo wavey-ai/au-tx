@@ -15,5 +15,5 @@ archive-webrtc = { path = "crates/archive-webrtc" }
 ctrlc = "3.4.5"
 gen-id = "0.2.1"
 rtrb = "0.3.1"
-frame-header = { path = "../frame-header" }
+frame-header = "0.2.2"
 tracing = "0.1.41"
